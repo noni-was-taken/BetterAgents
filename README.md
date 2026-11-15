@@ -7,6 +7,8 @@ A terminal dashboard for [Claude Code](https://claude.com/claude-code) backgroun
 - Colors follow your Hyprland/Noctalia wallpaper theme; the whole UI goes monochrome when the window loses focus
 - Start/stop/delete sessions without leaving the list
 
+Optional: with [claude-swap](https://github.com/realiti4/claude-swap) (`cswap`) installed, each managed account gets its own tab listing that account's sessions.
+
 Requires the `claude` CLI on your `PATH`. Linux; Rust 2024 toolchain.
 
 ## Install
@@ -23,6 +25,8 @@ betteragents
 | List | `j`/`k`, arrows | move |
 | List | `Enter` / `→` | open chat |
 | List | `f` | open chat fullscreen |
+| List | `/` | search (name, folder, category); `Esc` clears |
+| List | `a` | switch account tab (needs [claude-swap](https://github.com/realiti4/claude-swap)) |
 | List | `Tab` | switch status / category view |
 | List | `c` | categorize (`Tab`/arrows pick an existing one) |
 | List | `o` / `s` | bring online / take offline |

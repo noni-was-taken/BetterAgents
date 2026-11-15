@@ -76,6 +76,7 @@ enum Mode {
     Nav,
     Focus,
     Prompt(String),
+    Search,
     Confirm,
 }
 
@@ -87,24 +88,60 @@ enum Row {
 struct App {
     agents: Vec<Agent>,
     cats: HashMap<String, String>,
+    filter: String, // search text; empty = show everything
     by_category: bool,
     sel: String,
     mode: Mode,
     sess: HashMap<String, Sess>,
     msg: String,
+    accounts: Vec<(u32, String)>,
+    acct: Option<u32>, // None = default profile (your normal sessions)
     full: bool, // chat takes the whole window
     win_focused: bool, // is this terminal window focused (focus-change reporting)
     chat: Option<Rect>, // where the embedded chat is drawn, for mouse forwarding
 }
 
-fn load() -> Vec<Agent> {
-    let Ok(out) = Command::new("claude").args(["agents", "--json", "--all"]).output() else {
+/// `claude <args>` for the default profile, or `cswap run N -- <args>` for account N's isolated profile.
+fn cl(acct: Option<u32>, args: &[&str]) -> Command {
+    let mut c;
+    match acct {
+        Some(n) => { c = Command::new("cswap"); c.args(["run", &n.to_string(), "--"]); }
+        None => c = Command::new("claude"),
+    }
+    c.args(args);
+    c
+}
+
+/// Managed cswap accounts as (number, label). Empty when cswap isn't installed or has none.
+fn load_accounts() -> Vec<(u32, String)> {
+    let Ok(o) = Command::new("cswap").args(["list", "--json"]).stdin(std::process::Stdio::null()).output() else { return vec![] };
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+    v["accounts"].as_array().map_or(vec![], |a| {
+        a.iter().filter_map(|x| {
+            let n = x["number"].as_u64()? as u32;
+            Some((n, x["alias"].as_str().filter(|s| !s.is_empty()).map_or(format!("Account {n}"), String::from)))
+        }).collect()
+    })
+}
+
+/// Where account N's isolated profile keeps its job state (cswap: <data>/claude-swap/sessions/<N>-<slug>/).
+fn jobs_dir(acct: Option<u32>) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let Some(n) = acct else { return format!("{home}/.claude/jobs/") };
+    let base = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share")) + "/claude-swap/sessions/";
+    let pre = format!("{n}-");
+    std::fs::read_dir(&base).ok().and_then(|d| d.flatten().find(|e| e.file_name().to_string_lossy().starts_with(&pre)))
+        .map_or(String::new(), |e| format!("{}/jobs/", e.path().display()))
+}
+
+fn load(acct: Option<u32>) -> Vec<Agent> {
+    let Ok(out) = cl(acct, &["agents", "--json", "--all"]).stdin(std::process::Stdio::null()).output() else {
         return vec![];
     };
     let list: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
     // `--json` without --all lists only live sessions; everything else is offline
-    let live: Vec<String> = Command::new("claude")
-        .args(["agents", "--json"])
+    let live: Vec<String> = cl(acct, &["agents", "--json"])
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()
         .and_then(|o| serde_json::from_slice::<Vec<Value>>(&o.stdout).ok())
@@ -112,7 +149,7 @@ fn load() -> Vec<Agent> {
         .iter()
         .filter_map(|v| v["id"].as_str().map(String::from))
         .collect();
-    let jobs = std::env::var("HOME").unwrap_or_default() + "/.claude/jobs/";
+    let jobs = jobs_dir(acct);
     let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_string();
     let mut agents: Vec<Agent> = list
         .iter()
@@ -172,15 +209,15 @@ fn cat_list(c: &HashMap<String, String>) -> Vec<String> {
 }
 
 /// Run an optional `claude` subcommand then reload agents, off the UI thread.
-fn kick(tx: &Sender<(Vec<Agent>, String)>, args: Option<Vec<String>>) {
+fn kick(tx: &Sender<(Option<u32>, Vec<Agent>, String)>, acct: Option<u32>, args: Option<Vec<String>>) {
     let tx = tx.clone();
     thread::spawn(move || {
-        let msg = match args.map(|a| Command::new("claude").args(a).output()) {
+        let msg = match args.map(|a| cl(acct, &a.iter().map(String::as_str).collect::<Vec<_>>()).stdin(std::process::Stdio::null()).output()) {
             Some(Ok(o)) if !o.status.success() => String::from_utf8_lossy(&o.stderr).lines().chain(String::from_utf8_lossy(&o.stdout).lines()).next().unwrap_or("command failed").to_string(),
             Some(Err(e)) => e.to_string(),
             _ => String::new(),
         };
-        let _ = tx.send((load(), msg));
+        let _ = tx.send((acct, load(acct), msg));
         bump();
     });
 }
@@ -239,8 +276,17 @@ fn rows(a: &App) -> Vec<Row> {
             }
         }
     }
+    let q = a.filter.to_lowercase();
+    let keep = |i: usize| {
+        let ag = &a.agents[i];
+        q.is_empty() || format!("{} {} {}", ag.name, ag.cwd, a.cats.get(&ag.id).map_or("", |c| c.as_str())).to_lowercase().contains(&q)
+    };
     let mut out = vec![];
     for (label, col, v) in groups {
+        let v: Vec<usize> = v.into_iter().filter(|&i| keep(i)).collect();
+        if v.is_empty() {
+            continue;
+        }
         out.push(Row::Head(format!("{label} · {}", v.len()), col));
         out.extend(v.into_iter().map(Row::Agent));
     }
@@ -273,11 +319,12 @@ fn age(ms: u64) -> String {
     }
 }
 
-fn spawn(id: &str, rows: u16, cols: u16) -> Option<Sess> {
+fn spawn(acct: Option<u32>, id: &str, rows: u16, cols: u16) -> Option<Sess> {
     let pair = native_pty_system()
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .ok()?;
-    let mut cmd = CommandBuilder::new("claude");
+    let mut cmd = CommandBuilder::new(if acct.is_some() { "cswap" } else { "claude" });
+    if let Some(n) = acct { cmd.args(["run", &n.to_string(), "--"]); }
     cmd.args(["attach", id]);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -344,7 +391,7 @@ fn prompt_empty(s: &Sess) -> bool {
 }
 
 /// Grayscale equivalent of a terminal color (same brightness, no hue).
-fn mono(c: Color) -> Color {
+fn rgb_of(c: Color) -> Option<(u8, u8, u8)> {
     const X16: [(u8, u8, u8); 16] = [(0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0), (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229), (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0), (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)];
     let idx = |n: u8| -> (u8, u8, u8) {
         match n {
@@ -357,17 +404,26 @@ fn mono(c: Color) -> Color {
             _ => (8 + 10 * (n - 232), 8 + 10 * (n - 232), 8 + 10 * (n - 232)),
         }
     };
-    let (r, g, b) = match c {
+    Some(match c {
         Color::Rgb(r, g, b) => (r, g, b),
         Color::Indexed(n) => idx(n),
         Color::Black => X16[0], Color::Red => X16[1], Color::Green => X16[2], Color::Yellow => X16[3],
         Color::Blue => X16[4], Color::Magenta => X16[5], Color::Cyan => X16[6], Color::Gray => X16[7],
         Color::DarkGray => X16[8], Color::LightRed => X16[9], Color::LightGreen => X16[10], Color::LightYellow => X16[11],
         Color::LightBlue => X16[12], Color::LightMagenta => X16[13], Color::LightCyan => X16[14], Color::White => X16[15],
-        _ => return c, // Reset
-    };
-    let l = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
-    Color::Rgb(l, l, l)
+        _ => return None, // Reset: the terminal's own default, can't be recolored
+    })
+}
+
+fn mono(c: Color) -> Color {
+    rgb_of(c).map_or(c, |(r, g, b)| {
+        let l = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
+        Color::Rgb(l, l, l)
+    })
+}
+
+fn darken(c: Color) -> Color {
+    rgb_of(c).map_or(c, |(r, g, b)| Color::Rgb((r as f32 * 0.45) as u8, (g as f32 * 0.45) as u8, (b as f32 * 0.45) as u8))
 }
 
 fn key_bytes(k: KeyEvent) -> Vec<u8> {
@@ -420,18 +476,21 @@ fn ui_inner(f: &mut Frame, a: &mut App) {
         if on { Span::styled(format!(" {t} "), Style::new().fg(Color::Black).bg(accent()).bold()) } else { Span::styled(format!(" {t} "), Style::new().fg(gray())) }
     };
     let count = |s: &str| a.agents.iter().filter(|x| status_of(&x.state).0 == s).count();
-    f.render_widget(
-        Line::from(vec![
-            Span::styled(" BetterAgents ", Style::new().bold().fg(accent())),
-            tab(!a.by_category, "Status"),
-            tab(a.by_category, "Category"),
-            Span::styled(
-                format!("   {} needs input · {} working · {} idle", count("blocked"), count("working"), count("done")),
-                Style::new().fg(gray()),
-            ),
-        ]),
-        hd,
-    );
+    let mut head = vec![
+        Span::styled(" BetterAgents ", Style::new().bold().fg(accent())),
+        tab(!a.by_category, "Status"),
+        tab(a.by_category, "Category"),
+    ];
+    if !a.accounts.is_empty() {
+        head.push(Span::styled("  │ ", Style::new().fg(gray())));
+        head.push(tab(a.acct.is_none(), "Default"));
+        head.extend(a.accounts.iter().map(|(n, label)| tab(a.acct == Some(*n), label)));
+    }
+    head.push(Span::styled(
+        format!("   {} needs input · {} working · {} idle", count("blocked"), count("working"), count("done")),
+        Style::new().fg(gray()),
+    ));
+    f.render_widget(Line::from(head), hd);
 
     let [l, r] = if a.full { [Rect::default(), body] } else { Layout::horizontal([Constraint::Percentage(36), Constraint::Percentage(64)]).areas(body) };
     let focused = matches!(a.mode, Mode::Focus);
@@ -478,6 +537,16 @@ fn ui_inner(f: &mut Frame, a: &mut App) {
         l,
         &mut st,
     );
+    // chat has focus: darken the session picker (keeps hue, unlike the chat's monochrome)
+    if focused {
+        for y in l.top()..l.bottom() {
+            for x in l.left()..l.right() {
+                let c = &mut f.buffer_mut()[(x, y)];
+                (c.fg, c.bg) = (darken(c.fg), darken(c.bg));
+                c.modifier |= Modifier::DIM; // also dims the terminal's default-colored text
+            }
+        }
+    }
 
     // right pane: live chat if a session exists, else details
     let Some(ai) = sel_idx(a) else {
@@ -543,12 +612,17 @@ fn ui_inner(f: &mut Frame, a: &mut App) {
 
 fn footer(f: &mut Frame, a: &App, area: ratatui::layout::Rect) {
     let t = match &a.mode {
+        Mode::Search => format!(" search › {}   Enter keep · Esc clear", a.filter),
+        Mode::Nav if !a.filter.is_empty() => format!(" filter: {} · / edit · Esc clear", a.filter),
         Mode::Prompt(s) => format!(" category › {s}   Tab/↑↓ pick existing [{}] · Enter save · empty clears · Esc cancel", cat_list(&a.cats).join(", ")),
         Mode::Confirm => format!(" delete session '{}' permanently? y / n", a.agents.iter().find(|x| x.id == a.sel).map_or("", |x| &x.name)),
         Mode::Nav if !a.msg.is_empty() => format!(" {}", a.msg),
         Mode::Focus => " chat focused — keys go to the agent · F3 fullscreen · ← (empty input) or F2 back to list".into(),
-        Mode::Nav => " j/k move · Enter/→ chat · f fullscreen · Tab status/category view · c categorize · x close chat · o online · s offline · d delete · r refresh · q quit".into(),
+        Mode::Nav => " j/k move · / search · Enter/→ chat · a account · f fullscreen · Tab status/category view · c categorize · x close chat · o online · s offline · d delete · r refresh · q quit".into(),
     };
+    if matches!(a.mode, Mode::Search) {
+        f.set_cursor_position((area.x + AUTHOR.len() as u16 + 2 + 10 + a.filter.chars().count() as u16, area.y));
+    }
     if let Mode::Prompt(s) = &a.mode {
         f.set_cursor_position((area.x + AUTHOR.len() as u16 + 2 + 12 + s.chars().count() as u16, area.y));
     }
@@ -564,13 +638,14 @@ fn footer(f: &mut Frame, a: &App, area: ratatui::layout::Rect) {
 fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     load_theme();
     let cats = std::fs::read_to_string(cat_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let mut a = App { agents: load(), cats, by_category: false, sel: String::new(), mode: Mode::Nav, sess: HashMap::new(), msg: String::new(), win_focused: true, full: false, chat: None };
-    let (tx, rx) = mpsc::channel::<(Vec<Agent>, String)>();
+    let mut a = App { accounts: load_accounts(), acct: None, agents: load(None), cats, filter: String::new(), by_category: false, sel: String::new(), mode: Mode::Nav, sess: HashMap::new(), msg: String::new(), win_focused: true, full: false, chat: None };
+    let (tx, rx) = mpsc::channel::<(Option<u32>, Vec<Agent>, String)>();
     let mut loading = false;
     let mut last = Instant::now();
     let (mut dirty, mut last_sig) = (true, (0u64, 0u128));
     loop {
-        while let Ok((ag, msg)) = rx.try_recv() {
+        while let Ok((acct, ag, msg)) = rx.try_recv() {
+            if acct != a.acct { loading = false; continue; } // result for a tab we've left
             a.agents = ag;
             if !msg.is_empty() { a.msg = msg; }
             loading = false;
@@ -578,7 +653,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         a.sess.retain(|_, s| !s.dead.load(Relaxed));
         if last.elapsed() > Duration::from_secs(5) && !loading {
             loading = true;
-            kick(&tx, None);
+            kick(&tx, a.acct, None);
             load_theme();
             dirty = true;
             last = Instant::now();
@@ -635,6 +710,13 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                     let _ = s.writer.flush();
                 }
             }
+            Mode::Search => match k.code {
+                KeyCode::Enter => a.mode = Mode::Nav,
+                KeyCode::Esc => { a.filter.clear(); a.mode = Mode::Nav; }
+                KeyCode::Backspace => { a.filter.pop(); }
+                KeyCode::Char(c) => a.filter.push(c),
+                _ => {}
+            },
             Mode::Prompt(buf) => match k.code {
                 KeyCode::Enter => {
                     let v = buf.trim().to_string();
@@ -658,7 +740,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
             Mode::Confirm => {
                 if k.code == KeyCode::Char('y') {
                     if let Some(mut s) = a.sess.remove(&a.sel) { let _ = s.child.kill(); }
-                    kick(&tx, Some(vec!["rm".into(), a.sel.clone()]));
+                    kick(&tx, a.acct, Some(vec!["rm".into(), a.sel.clone()]));
                 }
                 a.mode = Mode::Nav;
             }
@@ -667,6 +749,8 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                 let ord = order(&a);
                 let pos = sel_idx(&a).and_then(|i| ord.iter().position(|&x| x == i)).unwrap_or(0);
                 match k.code {
+                    KeyCode::Esc if !a.filter.is_empty() => a.filter.clear(),
+                    KeyCode::Char('/') => a.mode = Mode::Search,
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('j') | KeyCode::Down => {
                         if let Some(&i) = ord.get((pos + 1).min(ord.len().saturating_sub(1))) { a.sel = a.agents[i].id.clone(); }
@@ -675,15 +759,23 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                         if let Some(&i) = ord.get(pos.saturating_sub(1)) { a.sel = a.agents[i].id.clone(); }
                     }
                     KeyCode::Tab => a.by_category = !a.by_category,
-                    KeyCode::Char('r') => kick(&tx, None),
+                    KeyCode::Char('r') => kick(&tx, a.acct, None),
                     KeyCode::Char('c') if !a.sel.is_empty() => a.mode = Mode::Prompt(a.cats.get(&a.sel).cloned().unwrap_or_default()),
                     KeyCode::Char('d') if !a.sel.is_empty() => a.mode = Mode::Confirm,
                     KeyCode::Char('o') if !a.sel.is_empty() => {
-                        kick(&tx, Some(vec!["respawn".into(), a.sel.clone()]));
+                        kick(&tx, a.acct, Some(vec!["respawn".into(), a.sel.clone()]));
                     }
                     KeyCode::Char('s') if !a.sel.is_empty() => {
                         if let Some(mut s) = a.sess.remove(&a.sel) { let _ = s.child.kill(); }
-                        kick(&tx, Some(vec!["stop".into(), a.sel.clone()]));
+                        kick(&tx, a.acct, Some(vec!["stop".into(), a.sel.clone()]));
+                    }
+                    KeyCode::Char('a') if !a.accounts.is_empty() => {
+                        // Default -> Account 1 -> Account 2 -> Default
+                        let i = a.acct.and_then(|n| a.accounts.iter().position(|x| x.0 == n));
+                        a.acct = match i { None if a.acct.is_none() => Some(a.accounts[0].0), Some(i) if i + 1 < a.accounts.len() => Some(a.accounts[i + 1].0), _ => None };
+                        a.agents.clear();
+                        a.sel.clear();
+                        kick(&tx, a.acct, None);
                     }
                     KeyCode::Char('f') if a.sess.contains_key(&a.sel) => (a.mode, a.full) = (Mode::Focus, true),
                     KeyCode::Char('x') => {
@@ -693,7 +785,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                         if !a.sess.contains_key(&a.sel) {
                             let sz = term.size()?;
                             let (rows, cols) = (sz.height.saturating_sub(4).max(5), (sz.width * 64 / 100).saturating_sub(2).max(20));
-                            if let Some(s) = spawn(&a.sel, rows, cols) { a.sess.insert(a.sel.clone(), s); }
+                            if let Some(s) = spawn(a.acct, &a.sel, rows, cols) { a.sess.insert(a.sel.clone(), s); }
                         }
                         if a.sess.contains_key(&a.sel) { a.mode = Mode::Focus; }
                     }
