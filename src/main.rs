@@ -63,6 +63,124 @@ struct Agent {
     color: Color,
 }
 
+struct Skill {
+    name: String, // what you type after `/`
+    desc: String,
+}
+
+/// Starter categories by use; `c` overrides them (saved in skill-categories.json).
+const SKILL_CATS: &[(&str, &[&str])] = &[
+    ("Web design & UI", &["partwise", "design-taste-frontend", "web-design-guidelines", "subtle-motion", "animate", "logo-design"]),
+    ("Token efficiency & output", &["ponytail", "ponytail-audit", "ponytail-debt", "ponytail-gain", "ponytail-help", "ponytail-review", "i-have-adhd", "handoff"]),
+    ("Research & writing", &["academic-paper", "academic-paper-reviewer", "academic-pipeline", "deep-research", "sr-screener"]),
+    ("Planning & decisions", &["grill-me", "llm-council"]),
+    ("Video, audio & art", &["brag", "brag-slim", "motion-broll", "sound-effects", "codixel"]),
+    ("Deploy & performance", &["deploy-to-vercel", "vercel-optimize", "vercel-react-best-practices"]),
+    ("Codebase & tools", &["graphify", "diagram", "agent-browser", "find-skills", "setup-matt-pocock-skills"]),
+    ("Notes (Obsidian)", &["obby"]),
+];
+
+fn default_skill_cat(name: &str) -> &'static str {
+    let base = name.split(':').next().unwrap_or(name); // plugin skills (obby:task-add) follow their plugin
+    SKILL_CATS.iter().find(|(_, l)| l.contains(&name) || l.contains(&base)).map_or("", |(c, _)| c)
+}
+
+/// (name, description) from a SKILL.md front matter; handles folded/quoted multi-line descriptions.
+fn skill_meta(path: &std::path::Path) -> Option<(String, String)> {
+    let t = std::fs::read_to_string(path).ok()?;
+    let fm = t.strip_prefix("---")?.split("\n---").next()?;
+    let unq = |v: &str| v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    let (mut name, mut desc, mut in_desc) = (String::new(), String::new(), false);
+    for l in fm.lines() {
+        if in_desc && (l.starts_with(' ') || l.starts_with('\t')) {
+            desc.push(' ');
+            desc.push_str(l.trim());
+            continue;
+        }
+        in_desc = false;
+        if let Some(v) = l.strip_prefix("name:") {
+            name = unq(v);
+        } else if let Some(v) = l.strip_prefix("description:") {
+            let v = v.trim();
+            desc = if matches!(v, ">" | "|" | ">-" | "|-" | "") { String::new() } else { v.to_string() };
+            in_desc = true;
+        }
+    }
+    Some((name, unq(&desc)))
+}
+
+/// Personal skills (~/.claude/skills) plus installed plugins' skills as `plugin:skill`.
+fn load_skills() -> Vec<Skill> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = vec![];
+    let mut scan = |dir: std::path::PathBuf, prefix: &str| {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if let Some((n, d)) = skill_meta(&e.path().join("SKILL.md")) {
+                let n = if n.is_empty() { e.file_name().to_string_lossy().into_owned() } else { n };
+                out.push(Skill { name: format!("{prefix}{n}"), desc: d });
+            }
+        }
+    };
+    scan(format!("{home}/.claude/skills").into(), "");
+    let ip: Value = std::fs::read_to_string(format!("{home}/.claude/plugins/installed_plugins.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    for (key, v) in ip["plugins"].as_object().into_iter().flatten() {
+        if let Some(path) = v[0]["installPath"].as_str() {
+            scan(format!("{path}/skills").into(), &format!("{}:", key.split('@').next().unwrap_or(key)));
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.dedup_by(|a, b| a.name == b.name);
+    out
+}
+
+fn scat_path() -> String {
+    std::env::var("HOME").unwrap_or_default() + "/.config/betteragents/skill-categories.json"
+}
+
+fn skill_cat(a: &App, name: &str) -> String {
+    a.scats.get(name).cloned().unwrap_or_else(|| default_skill_cat(name).to_string()) // "" = uncategorized
+}
+
+/// categories offered by the `c` prompt for whichever list is showing
+fn cur_cat_list(a: &App) -> Vec<String> {
+    if !a.skills_view {
+        return cat_list(&a.cats);
+    }
+    let mut l: Vec<String> = a.skills.iter().map(|s| skill_cat(a, &s.name)).filter(|c| !c.is_empty()).collect();
+    l.sort();
+    l.dedup();
+    l
+}
+
+/// Skills list rows with a selection key each: "#<category>" for a header, the skill name for a skill.
+/// Categories start collapsed; a search shows every match regardless.
+fn skill_rows(a: &App) -> Vec<(Row, String)> {
+    let q = a.filter.to_lowercase();
+    let mut m: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, sk) in a.skills.iter().enumerate() {
+        let c = skill_cat(a, &sk.name);
+        if q.is_empty() || format!("{} {} {}", sk.name, sk.desc, c).to_lowercase().contains(&q) {
+            m.entry(c).or_default().push(i);
+        }
+    }
+    let none = m.remove("");
+    let mut out = vec![];
+    for (c, v) in m.into_iter().chain(none.map(|v| (String::new(), v))) {
+        let key = format!("#{c}");
+        let open = !q.is_empty() || a.open.contains(&key);
+        let label = if c.is_empty() { "UNCATEGORIZED".to_string() } else { c.to_uppercase() };
+        out.push((Row::Head(format!("{} {label} · {}", if open { "▾" } else { "▸" }, v.len()), if c.is_empty() { gray() } else { accent() }), key));
+        if open {
+            out.extend(v.into_iter().map(|i| (Row::Agent(i), a.skills[i].name.clone())));
+        }
+    }
+    out
+}
+
+fn skill_keys(a: &App) -> Vec<String> {
+    skill_rows(a).into_iter().map(|(_, k)| k).collect()
+}
+
 struct Sess {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
@@ -89,6 +207,14 @@ struct App {
     agents: Vec<Agent>,
     cats: HashMap<String, String>,
     filter: String, // search text; empty = show everything
+    skills: Vec<Skill>,
+    scats: HashMap<String, String>, // skill name -> category ("" = explicitly uncategorized)
+    skills_view: bool,
+    sk: String, // selected row: a skill name, or "#<category>" for a header
+    open: std::collections::HashSet<String>, // expanded skill categories ("#<category>")
+    flip: std::collections::HashSet<String>, // session groups toggled away from their default open state
+    head: Option<String>, // Some(group key) when a session-list header is selected
+    pending: Option<(String, String, Instant)>, // (session id, text to type, since): sent once its prompt is ready
     by_category: bool,
     sel: String,
     mode: Mode,
@@ -162,7 +288,14 @@ fn load(acct: Option<u32>) -> Vec<Agent> {
             Agent {
                 name: Some(s(a, "name")).filter(|n| !n.is_empty()).unwrap_or_else(|| s(a, "cwd").rsplit('/').next().unwrap_or("session").to_string()),
                 cwd: s(a, "cwd"),
-                state: if live.contains(&id) { s(a, "state") } else { "stopped".into() },
+                state: if !live.contains(&id) {
+                    "stopped".into()
+                } else if s(a, "state") == "working" && st["tempo"] == "idle" && st["inFlight"]["tasks"].as_u64().unwrap_or(0) == 0 {
+                    // Claude sometimes leaves `state: working` after the turn ends; its tempo says idle
+                    "done".into()
+                } else {
+                    s(a, "state")
+                },
                 started: a["startedAt"].as_u64().unwrap_or(0),
                 detail: s(&st, "detail"),
                 result: st["output"]["result"].as_str().unwrap_or("").to_string(),
@@ -190,12 +323,11 @@ fn chip(c: &str) -> Color {
     }
 }
 
-/// glyph: needs input *, working = animated flower, idle = still flower, offline ·
+/// glyph: needs input *, working ✻, idle = still flower, offline ·
 fn glyph(state: &str) -> &'static str {
-    const FLOWER: [&str; 6] = ["✻", "✽", "✶", "✳", "✢", "✱"];
     match state {
         "blocked" => "*",
-        "working" => FLOWER[(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() / 150 % 6) as usize],
+        "working" => "✻", // static: an animated glyph forces redraws that drag the cursor trail
         "done" => "✱",
         _ => "·",
     }
@@ -249,7 +381,14 @@ fn status_of(state: &str) -> (&'static str, &'static str, Color) {
     }
 }
 
-fn rows(a: &App) -> Vec<Row> {
+/// Group open state: Category groups and OFFLINE start collapsed, the rest open; `flip` holds the user's toggles.
+fn group_open(a: &App, key: &str) -> bool {
+    let default = !key.starts_with("#c:") && key != "#s:OFFLINE";
+    !a.filter.is_empty() || default != a.flip.contains(key)
+}
+
+/// Session list rows, each with a selection key: "#s:<status>" / "#c:<category>" for a header, the agent id otherwise.
+fn rows(a: &App) -> Vec<(Row, String)> {
     let mut groups: Vec<(String, Color, Vec<usize>)> = vec![];
     if a.by_category {
         let mut m: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -263,6 +402,7 @@ fn rows(a: &App) -> Vec<Row> {
             }
             groups.push((k.to_uppercase(), accent(), v));
         }
+        groups.sort_by(|x, y| x.0.cmp(&y.0)); // labels are uppercased, so this ignores the original case
         let none: Vec<usize> = (0..a.agents.len()).filter(|&i| !a.cats.get(&a.agents[i].id).is_some_and(|c| !c.is_empty())).collect();
         if !none.is_empty() {
             groups.push(("UNCATEGORIZED".into(), gray(), none));
@@ -287,14 +427,31 @@ fn rows(a: &App) -> Vec<Row> {
         if v.is_empty() {
             continue;
         }
-        out.push(Row::Head(format!("{label} · {}", v.len()), col));
-        out.extend(v.into_iter().map(Row::Agent));
+        let key = format!("#{}:{label}", if a.by_category { 'c' } else { 's' });
+        let open = group_open(a, &key);
+        out.push((Row::Head(format!("{} {label} · {}", if open { "▾" } else { "▸" }, v.len()), col), key));
+        if open {
+            out.extend(v.into_iter().map(|i| (Row::Agent(i), a.agents[i].id.clone())));
+        }
     }
     out
 }
 
-fn order(a: &App) -> Vec<usize> {
-    rows(a).iter().filter_map(|r| if let Row::Agent(i) = r { Some(*i) } else { None }).collect()
+fn row_keys(a: &App) -> Vec<String> {
+    rows(a).into_iter().map(|(_, k)| k).collect()
+}
+
+/// header key of the group a session is listed under
+fn group_of(a: &App, id: &str) -> Option<String> {
+    let mut head = None;
+    for (r, k) in rows(a) {
+        match r {
+            Row::Head(..) => head = Some(k),
+            Row::Agent(_) if k == id => return head,
+            _ => {}
+        }
+    }
+    None
 }
 
 fn sel_idx(a: &App) -> Option<usize> {
@@ -302,10 +459,21 @@ fn sel_idx(a: &App) -> Option<usize> {
 }
 
 fn fix_sel(a: &mut App) {
-    if sel_idx(a).is_none_or(|i| !order(a).contains(&i)) {
-        if let Some(&i) = order(a).first() {
-            a.sel = a.agents[i].id.clone();
+    let keys = row_keys(a);
+    if let Some(h) = &a.head {
+        if keys.contains(h) {
+            return; // on a header; a.sel keeps the last session for the right pane
         }
+        a.head = None;
+    }
+    if keys.contains(&a.sel) {
+        return;
+    }
+    // prefer the first visible session, else the first header
+    if let Some(k) = keys.iter().find(|k| !k.starts_with('#')) {
+        a.sel = k.clone();
+    } else if let Some(k) = keys.first() {
+        a.head = Some(k.clone());
     }
 }
 
@@ -457,11 +625,13 @@ fn key_bytes(k: KeyEvent) -> Vec<u8> {
 fn ui(f: &mut Frame, a: &mut App) {
     ui_inner(f, a);
     if !a.win_focused {
+        // window lost focus: darken everything (keeps hue)
         let area = f.area();
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
                 let c = &mut f.buffer_mut()[(x, y)];
-                (c.fg, c.bg) = (mono(c.fg), mono(c.bg));
+                (c.fg, c.bg) = (darken(c.fg), darken(c.bg));
+                c.modifier |= Modifier::DIM;
             }
         }
     }
@@ -478,8 +648,9 @@ fn ui_inner(f: &mut Frame, a: &mut App) {
     let count = |s: &str| a.agents.iter().filter(|x| status_of(&x.state).0 == s).count();
     let mut head = vec![
         Span::styled(" BetterAgents ", Style::new().bold().fg(accent())),
-        tab(!a.by_category, "Status"),
-        tab(a.by_category, "Category"),
+        tab(!a.by_category && !a.skills_view, "Status"),
+        tab(a.by_category && !a.skills_view, "Category"),
+        tab(a.skills_view, "Skills"),
     ];
     if !a.accounts.is_empty() {
         head.push(Span::styled("  │ ", Style::new().fg(gray())));
@@ -499,22 +670,86 @@ fn ui_inner(f: &mut Frame, a: &mut App) {
         if on { Span::styled(format!(" ▶ {t} "), Style::new().fg(Color::Black).bg(accent()).bold()) } else { Span::styled(format!(" {t} "), Style::new().fg(gray())) }
     };
 
+    if a.skills_view {
+        let mut items = vec![];
+        let mut disp = None;
+        for (row, key) in &skill_rows(a) {
+            if *key == a.sk {
+                disp = Some(items.len());
+            }
+            match row {
+                Row::Head(t, c) => items.push(ListItem::new(Line::from(Span::styled(format!("▍{t}"), Style::new().fg(*c).bold())))),
+                Row::Agent(i) => items.push(ListItem::new(Line::from(Span::styled(format!("    /{}", a.skills[*i].name), Style::new().fg(text()))))),
+            }
+        }
+        let mut st = ListState::default().with_selected(disp);
+        f.render_stateful_widget(
+            List::new(items)
+                .block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(accent())).title(tag(true, format!("SKILLS · {}", a.skills.len()))))
+                .highlight_style(Style::new().bg(hl()).add_modifier(Modifier::BOLD)),
+            l,
+            &mut st,
+        );
+        let target = a.agents.iter().find(|x| x.id == a.sel).map(|x| x.name.clone());
+        let lines = match a.skills.iter().find(|s| s.name == a.sk) {
+            Some(sk) => {
+                let c = skill_cat(a, &sk.name);
+                vec![
+                    Line::from(Span::styled(format!("/{}", sk.name), Style::new().bold().fg(Color::White))),
+                    Line::from(Span::styled(format!("category: {}", if c.is_empty() { "—" } else { &c }), Style::new().fg(gray()))),
+                    Line::raw(""),
+                    Line::from(Span::styled(sk.desc.clone(), Style::new().fg(text()))),
+                    Line::raw(""),
+                    Line::from(Span::styled(
+                        match &target {
+                            Some(t) => format!("Enter → type /{} into {t}'s chat", sk.name),
+                            None => "select a session first (p → sessions)".into(),
+                        },
+                        Style::new().fg(accent()),
+                    )),
+                ]
+            }
+            None if a.sk.starts_with('#') => {
+                let c = &a.sk[1..];
+                let n = a.skills.iter().filter(|s| skill_cat(a, &s.name) == c).count();
+                vec![
+                    Line::from(Span::styled(if c.is_empty() { "Uncategorized" } else { c }.to_string(), Style::new().bold().fg(Color::White))),
+                    Line::from(Span::styled(format!("{n} skills"), Style::new().fg(gray()))),
+                    Line::raw(""),
+                    Line::from(Span::styled((if a.open.contains(&a.sk) { "Enter/← collapse" } else { "Enter/→ expand" }).to_string(), Style::new().fg(accent()))),
+                ]
+            }
+            None => vec![Line::raw("no skills found")],
+        };
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(gray())).title(" skill ")),
+            r,
+        );
+        return footer(f, a, ft);
+    }
+
     // list
     let rs = rows(a);
     let mut items = vec![];
     let mut disp = None;
-    for row in &rs {
+    for (row, key) in &rs {
         match row {
-            Row::Head(t, c) => items.push(ListItem::new(Line::from(Span::styled(format!("▍{t}"), Style::new().fg(*c).bold())))),
+            Row::Head(t, c) => {
+                if a.head.as_ref() == Some(key) {
+                    disp = Some(items.len());
+                }
+                items.push(ListItem::new(Line::from(Span::styled(format!("▍{t}"), Style::new().fg(*c).bold()))))
+            }
             Row::Agent(i) => {
                 let ag = &a.agents[*i];
-                if ag.id == a.sel {
+                let picked = a.head.is_none() && ag.id == a.sel;
+                if picked {
                     disp = Some(items.len());
                 }
                 let (_, _, col) = status_of(&ag.state);
                 let mut sp = vec![
                     Span::styled(format!("  {} ", glyph(&ag.state)), Style::new().fg(col)),
-                    Span::styled(format!(" {} ", ag.name), if ag.id == a.sel { Style::new().fg(ag.color).bg(hl()).add_modifier(Modifier::BOLD) } else { Style::new().fg(Color::Black).bg(ag.color).add_modifier(Modifier::BOLD) }),
+                    Span::styled(format!(" {} ", ag.name), if picked { Style::new().fg(ag.color).bg(hl()).add_modifier(Modifier::BOLD) } else { Style::new().fg(Color::Black).bg(ag.color).add_modifier(Modifier::BOLD) }),
                 ];
                 if a.sess.contains_key(&ag.id) {
                     sp.push(Span::styled(" ▸chat", Style::new().fg(accent())));
@@ -614,11 +849,12 @@ fn footer(f: &mut Frame, a: &App, area: ratatui::layout::Rect) {
     let t = match &a.mode {
         Mode::Search => format!(" search › {}   Enter keep · Esc clear", a.filter),
         Mode::Nav if !a.filter.is_empty() => format!(" filter: {} · / edit · Esc clear", a.filter),
-        Mode::Prompt(s) => format!(" category › {s}   Tab/↑↓ pick existing [{}] · Enter save · empty clears · Esc cancel", cat_list(&a.cats).join(", ")),
+        Mode::Prompt(s) => format!(" category › {s}   Tab/↑↓ pick existing [{}] · Enter save · empty clears · Esc cancel", cur_cat_list(a).join(", ")),
         Mode::Confirm => format!(" delete session '{}' permanently? y / n", a.agents.iter().find(|x| x.id == a.sel).map_or("", |x| &x.name)),
         Mode::Nav if !a.msg.is_empty() => format!(" {}", a.msg),
+        Mode::Nav if a.skills_view => " j/k move · Enter/→ expand or use · ← collapse · / search · c categorize · p sessions · q quit".into(),
         Mode::Focus => " chat focused — keys go to the agent · F3 fullscreen · ← (empty input) or F2 back to list".into(),
-        Mode::Nav => " j/k move · / search · Enter/→ chat · a account · f fullscreen · Tab status/category view · c categorize · x close chat · o online · s offline · d delete · r refresh · q quit".into(),
+        Mode::Nav => " j/k move · / search · Enter/→ chat · a account · f fullscreen · Tab status/category view · p skills · c categorize · x close chat · o online · s offline · d delete · r refresh · q quit".into(),
     };
     if matches!(a.mode, Mode::Search) {
         f.set_cursor_position((area.x + AUTHOR.len() as u16 + 2 + 10 + a.filter.chars().count() as u16, area.y));
@@ -638,14 +874,25 @@ fn footer(f: &mut Frame, a: &App, area: ratatui::layout::Rect) {
 fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     load_theme();
     let cats = std::fs::read_to_string(cat_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let mut a = App { accounts: load_accounts(), acct: None, agents: load(None), cats, filter: String::new(), by_category: false, sel: String::new(), mode: Mode::Nav, sess: HashMap::new(), msg: String::new(), win_focused: true, full: false, chat: None };
+    let mut a = App { accounts: load_accounts(), acct: None, agents: load(None), cats, filter: String::new(), skills: vec![], scats: std::fs::read_to_string(scat_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(), skills_view: false, sk: String::new(), open: Default::default(), flip: Default::default(), head: None, pending: None, by_category: false, sel: String::new(), mode: Mode::Nav, sess: HashMap::new(), msg: String::new(), win_focused: true, full: false, chat: None };
     let (tx, rx) = mpsc::channel::<(Option<u32>, Vec<Agent>, String)>();
     let mut loading = false;
     let mut last = Instant::now();
-    let (mut dirty, mut last_sig) = (true, (0u64, 0u128));
+    let (mut dirty, mut last_sig) = (true, 0u64);
     loop {
         while let Ok((acct, ag, msg)) = rx.try_recv() {
             if acct != a.acct { loading = false; continue; } // result for a tab we've left
+            // desktop notification when a session stops working (done, or waiting on you), only while you're elsewhere
+            let prev: HashMap<&str, &str> = if a.win_focused { HashMap::new() } else { a.agents.iter().map(|x| (x.id.as_str(), x.state.as_str())).collect() };
+            for n in &ag {
+                if prev.get(n.id.as_str()) == Some(&"working") && matches!(n.state.as_str(), "done" | "blocked") {
+                    let title = format!("{} {}", n.name, if n.state == "done" { "is done" } else { "needs input" });
+                    let body: String = n.detail.chars().take(200).collect();
+                    thread::spawn(move || {
+                        let _ = Command::new("notify-send").args(["-a", "BetterAgents", "-i", "dialog-information", &title, &body]).status();
+                    });
+                }
+            }
             a.agents = ag;
             if !msg.is_empty() { a.msg = msg; }
             loading = false;
@@ -659,15 +906,41 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
             last = Instant::now();
         }
         fix_sel(&mut a);
+        if a.skills_view {
+            let o = skill_keys(&a);
+            if !o.contains(&a.sk) {
+                if let Some(k) = o.first() { a.sk = k.clone(); }
+            }
+        }
+        // type the chosen `/skill` once the attached chat shows its `❯` prompt (it needs a moment to load)
+        if let Some((id, txt, t0)) = a.pending.clone() {
+            match a.sess.get_mut(&id) {
+                Some(s) => {
+                    let ready = {
+                        let p = s.parser.lock().unwrap();
+                        let (row, _) = p.screen().cursor_position();
+                        p.screen().cell(row, 0).is_some_and(|c| c.contents() == "❯")
+                    };
+                    if ready {
+                        let _ = s.writer.write_all(txt.as_bytes());
+                        let _ = s.writer.flush();
+                        a.pending = None;
+                    } else if t0.elapsed() > Duration::from_secs(15) {
+                        a.pending = None;
+                        a.msg = format!("chat wasn't ready; type {} yourself", txt.trim());
+                    }
+                }
+                None => a.pending = None,
+            }
+        }
         if matches!(a.mode, Mode::Focus) && !a.sess.contains_key(&a.sel) {
             a.mode = Mode::Nav;
         }
         if !matches!(a.mode, Mode::Focus) {
             a.full = false;
         }
-        // redraw only on input, new output/data, the 5s tick, or the working-flower animation frame
-        let anim = if a.agents.iter().any(|x| x.state == "working") { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() / 150 } else { 0 };
-        let sig = (TICK.load(Relaxed), anim);
+        // redraw only on input, new output/data, the 5s tick
+        let sig = TICK.load(Relaxed);
         if dirty || sig != last_sig {
             term.draw(|f| ui(f, &mut a))?;
             (last_sig, dirty) = (sig, false);
@@ -699,6 +972,7 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         if k.kind != KeyEventKind::Press {
             continue;
         }
+        let cl = cur_cat_list(&a);
         match &mut a.mode {
             Mode::Focus => {
                 if k.code == KeyCode::F(3) {
@@ -720,14 +994,20 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
             Mode::Prompt(buf) => match k.code {
                 KeyCode::Enter => {
                     let v = buf.trim().to_string();
-                    if v.is_empty() { a.cats.remove(&a.sel); } else { a.cats.insert(a.sel.clone(), v); }
-                    save_cats(&a.cats);
+                    if a.skills_view {
+                        a.open.insert(format!("#{v}")); // keep the moved skill visible
+                        a.scats.insert(a.sk.clone(), v); // "" keeps it uncategorized even if it has a starter category
+                        let _ = std::fs::write(scat_path(), serde_json::to_string_pretty(&a.scats).unwrap_or_default());
+                    } else {
+                        if v.is_empty() { a.cats.remove(&a.sel); } else { a.cats.insert(a.sel.clone(), v); }
+                        save_cats(&a.cats);
+                    }
                     a.mode = Mode::Nav;
                 }
                 KeyCode::Esc => a.mode = Mode::Nav,
                 KeyCode::Backspace => { buf.pop(); }
                 KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
-                    let l = cat_list(&a.cats);
+                    let l = &cl;
                     if !l.is_empty() {
                         let i = l.iter().position(|c| c == buf);
                         let n = if k.code == KeyCode::Up { i.map_or(l.len() - 1, |i| (i + l.len() - 1) % l.len()) } else { i.map_or(0, |i| (i + 1) % l.len()) };
@@ -744,19 +1024,89 @@ fn run(term: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                 }
                 a.mode = Mode::Nav;
             }
-            Mode::Nav => {
+            Mode::Nav if a.skills_view => {
                 a.msg.clear();
-                let ord = order(&a);
-                let pos = sel_idx(&a).and_then(|i| ord.iter().position(|&x| x == i)).unwrap_or(0);
+                let ord = skill_keys(&a);
+                let pos = ord.iter().position(|k| *k == a.sk).unwrap_or(0);
+                let on_head = a.sk.starts_with('#');
                 match k.code {
                     KeyCode::Esc if !a.filter.is_empty() => a.filter.clear(),
                     KeyCode::Char('/') => a.mode = Mode::Search,
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('p') => a.skills_view = false,
                     KeyCode::Char('j') | KeyCode::Down => {
-                        if let Some(&i) = ord.get((pos + 1).min(ord.len().saturating_sub(1))) { a.sel = a.agents[i].id.clone(); }
+                        if let Some(k) = ord.get((pos + 1).min(ord.len().saturating_sub(1))) { a.sk = k.clone(); }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
-                        if let Some(&i) = ord.get(pos.saturating_sub(1)) { a.sel = a.agents[i].id.clone(); }
+                        if let Some(k) = ord.get(pos.saturating_sub(1)) { a.sk = k.clone(); }
+                    }
+                    KeyCode::Enter if on_head => {
+                        if !a.open.remove(&a.sk) { a.open.insert(a.sk.clone()); }
+                    }
+                    KeyCode::Right if on_head => { a.open.insert(a.sk.clone()); }
+                    KeyCode::Left => {
+                        // collapse this category (from its header or any skill in it) and land on the header
+                        let key = if on_head { a.sk.clone() } else { format!("#{}", skill_cat(&a, &a.sk)) };
+                        a.open.remove(&key);
+                        a.sk = key;
+                    }
+                    KeyCode::Char('c') if !a.sk.is_empty() && !on_head => a.mode = Mode::Prompt(skill_cat(&a, &a.sk)),
+                    KeyCode::Enter if !a.sk.is_empty() => {
+                        if a.sel.is_empty() {
+                            a.msg = "select a session first (p → sessions)".into();
+                        } else {
+                            if !a.sess.contains_key(&a.sel) {
+                                let sz = term.size()?;
+                                let (rows, cols) = (sz.height.saturating_sub(4).max(5), (sz.width * 64 / 100).saturating_sub(2).max(20));
+                                if let Some(s) = spawn(a.acct, &a.sel, rows, cols) { a.sess.insert(a.sel.clone(), s); }
+                            }
+                            if a.sess.contains_key(&a.sel) {
+                                a.pending = Some((a.sel.clone(), format!("/{} ", a.sk), Instant::now()));
+                                a.skills_view = false;
+                                a.mode = Mode::Focus;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Mode::Nav => {
+                a.msg.clear();
+                let ord = row_keys(&a);
+                let cur = a.head.clone().unwrap_or_else(|| a.sel.clone());
+                let pos = ord.iter().position(|k| *k == cur).unwrap_or(0);
+                let on_head = a.head.is_some();
+                let go = |a: &mut App, k: &String| if k.starts_with('#') { a.head = Some(k.clone()) } else { (a.head, a.sel) = (None, k.clone()) };
+                match k.code {
+                    KeyCode::Enter if on_head => {
+                        let h = a.head.clone().unwrap();
+                        if !a.flip.remove(&h) { a.flip.insert(h); }
+                    }
+                    KeyCode::Right if on_head => {
+                        let h = a.head.clone().unwrap();
+                        if !group_open(&a, &h) { if !a.flip.remove(&h) { a.flip.insert(h); } }
+                    }
+                    KeyCode::Left => {
+                        // collapse the group (from its header or a session in it) and land on its header
+                        let h = if on_head { a.head.clone() } else { group_of(&a, &a.sel) };
+                        if let Some(h) = h {
+                            if group_open(&a, &h) { if !a.flip.remove(&h) { a.flip.insert(h.clone()); } }
+                            a.head = Some(h);
+                        }
+                    }
+                    KeyCode::Char('c' | 'd' | 'o' | 's' | 'f' | 'x') if on_head => {} // session actions need a session
+                    KeyCode::Esc if !a.filter.is_empty() => a.filter.clear(),
+                    KeyCode::Char('/') => a.mode = Mode::Search,
+                    KeyCode::Char('p') => {
+                        a.skills = load_skills(); // re-read each time so new skills show up
+                        a.skills_view = true;
+                    }
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if let Some(k) = ord.get((pos + 1).min(ord.len().saturating_sub(1))) { go(&mut a, k); }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if let Some(k) = ord.get(pos.saturating_sub(1)) { go(&mut a, k); }
                     }
                     KeyCode::Tab => a.by_category = !a.by_category,
                     KeyCode::Char('r') => kick(&tx, a.acct, None),
@@ -815,4 +1165,20 @@ fn main() -> std::io::Result<()> {
     }
     ratatui::restore();
     res
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn skill_meta_reads_folded_and_quoted_descriptions() {
+        let dir = std::env::temp_dir().join("ba-skill-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("SKILL.md");
+        std::fs::write(&f, "---\nname: demo\ndescription: >\n  first line\n  second line\nother: x\n---\nbody\n").unwrap();
+        assert_eq!(super::skill_meta(&f), Some(("demo".into(), "first line second line".into())));
+        std::fs::write(&f, "---\nname: q\ndescription: \"quoted, one line\"\n---\n").unwrap();
+        assert_eq!(super::skill_meta(&f).unwrap().1, "quoted, one line");
+        assert_eq!(super::default_skill_cat("obby:task-add"), "Notes (Obsidian)");
+        assert_eq!(super::default_skill_cat("partwise"), "Web design & UI");
+    }
 }
